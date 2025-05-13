@@ -165,3 +165,25 @@ while true; do
   esac
 done
 ```
+
+
+## get id 
+
+```bash
+get_deployment_id() {
+  local deployment_name="$1"
+  
+  # Query AWS for deployment with matching name
+  deployment_id=$(aws rds describe-blue-green-deployments \
+    --query "BlueGreenDeployments[?BlueGreenDeploymentIdentifier=='${deployment_name}'].BlueGreenDeploymentIdentifier" \
+    --output text)
+  
+  if [[ -z "$deployment_id" ]]; then
+    echo "Error: Deployment '${deployment_name}' not found" >&2
+    return 1
+  fi
+  
+  echo "$deployment_id"
+  return 0
+}
+```
