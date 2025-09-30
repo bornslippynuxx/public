@@ -109,4 +109,39 @@ def auth_user_oauth(self, userinfo):
 
 3. **Migration Path**: If migrating from 2.11, your existing OAuth configuration should mostly work, but test thoroughly in a non-production environment first
 
+Yes, there are several known bugs and issues with OAuth authentication in Airflow 3.0 when using the `apache-airflow-providers-fab` package:
+
+## Critical Issues
+
+### 1. **HTTP vs HTTPS Redirect URI Problem** (Issue #49781)
+The removal of the `AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX` configuration option in Airflow 3.0 has broken OAuth sign-in with FAB. The redirect URI is being generated with HTTP instead of HTTPS, causing authentication failures due to redirect URI mismatches.
+
+**Workaround**: In Airflow 2.x, this was solved by setting `AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX = True`, but this option was removed in 3.0, leaving OAuth broken for deployments behind reverse proxies.
+
+### 2. **Google OAuth Login Issues** (Issue #52226)
+Users report being unable to login using FAB with Google OAuth in Airflow 3.0.2, encountering JWT token validation errors with the message "JWT token is not valid: The specified alg value is not allowed".
+
+### 3. **API Authentication Confusion** (Issue #50684)
+There's confusion about how API authentication works in Airflow 3.0 with the FAB provider. The `requires_authentication` decorator in custom API authentication backends appears to have become obsolete, and the documentation may be outdated regarding proper implementation methods.
+
+### 4. **Database Users Cannot Authenticate with OAuth Configured** (Issue #51662)
+When OAuth is configured as the primary authentication type, users created via the CLI command cannot authenticate through the API, even when basic auth backend is properly configured.
+
+### 5. **LDAP JWT Token Generation Fails** (Issue #52103)
+LDAP users cannot generate JWT tokens via the `/auth/token` endpoint in Airflow 3.0 with FAB auth manager, even though they can successfully log in through the web UI.
+
+### 6. **Missing Dependencies**
+The `authlib` module is required for OAuth but may not be automatically installed, causing import errors.
+
+## Recommendations
+
+1. **Monitor Issue #49781** closely - this is the most critical issue affecting OAuth deployments behind proxies
+2. **Test thoroughly** in a non-production environment before migrating
+3. Consider these workarounds:
+   - For proxy issues: May need custom middleware to handle `X-Forwarded-Proto` headers
+   - For missing dependencies: Explicitly install `authlib` package
+4. **Check the redirect URI path** - In Airflow 3.0, the OAuth callback path changed from `/oauth-authorized/{provider}` to `/auth/oauth-authorized/{provider}`, so you'll need to update your OAuth provider configuration
+
+Would you like me to search for more specific information about any of these issues or look for potential workarounds?
+
 Would you like me to search for the most current documentation on specific OAuth provider configurations (like Okta, Azure AD, Google, etc.) for Airflow 3.0?
