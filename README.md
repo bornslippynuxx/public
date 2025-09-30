@@ -1,64 +1,112 @@
-I'll help you create a high-level plan for upgrading your Airflow deployment from 2.10.4 to 2.11 on AWS while addressing CVEs.
+The configuration for external OAuth providers in Airflow 3.0 with `apache-airflow-providers-fab` is quite similar to Airflow 2.x, but there are some important changes to be aware of.
 
-## High-Level Airflow Upgrade Plan
+## Key Changes in Airflow 3.0
 
-### 1. Pre-Upgrade Assessment
-- Review Airflow 2.11 release notes and breaking changes
-- Audit current DAGs for deprecated features or API changes
-- Identify all custom operators, hooks, and plugins that need testing
-- Document current infrastructure configuration (instance types, scaling settings, connections, variables)
-- Create inventory of Python dependencies and their versions
+In Airflow 3.0, FAB (Flask-AppBuilder) has been moved to a separate provider package (`apache-airflow-providers-fab`), but the OAuth configuration approach remains largely the same.
 
-### 2. Image Preparation
-- Create new Dockerfile based on Airflow 2.11
-- Update base image to use latest stable Python version compatible with Airflow 2.11
-- Upgrade all Python libraries to patch CVEs (use `pip-audit` or `safety` to scan)
-- Update system packages in the base OS layer
-- Rebuild provider packages to latest compatible versions
-- Implement multi-stage build to minimize image size and attack surface
+## Configuration Steps
 
-### 3. Development/Testing Environment
-- Deploy upgraded Airflow 2.11 in a separate dev/test environment
-- Run security scans on new image (Trivy, Snyk, or AWS ECR scanning)
-- Test all critical DAGs end-to-end
-- Validate connections to external systems (databases, S3, APIs)
-- Performance test with representative workload
-- Verify monitoring and logging still function correctly
+Here's how to configure external OAuth in Airflow 3.0:
 
-### 4. Backup and Rollback Preparation
-- Back up Airflow metadata database
-- Document current configuration (terraform/CloudFormation if applicable)
-- Export all connections, variables, and pools
-- Tag current production image as rollback version
-- Create rollback runbook with specific steps and timings
+### 1. Install the FAB Provider
 
-### 5. Production Upgrade
-- Schedule maintenance window with stakeholders
-- Pause all DAG schedules
-- Wait for running tasks to complete (or set appropriate timeout)
-- Deploy new Airflow 2.11 image
-- Run database migrations (`airflow db migrate`)
-- Restore connections/variables if needed
-- Gradually unpause DAGs and monitor
+```bash
+pip install apache-airflow-providers-fab
+```
 
-### 6. Post-Upgrade Validation
-- Monitor system metrics (CPU, memory, database connections)
-- Verify scheduler and worker health
-- Check DAG parsing times and task execution
-- Review logs for errors or warnings
-- Validate data pipeline outputs match expected results
-- Run security scan on deployed environment
+### 2. Configure airflow.cfg
 
-### 7. Documentation and Cleanup
-- Update runbooks and documentation
-- Document any configuration changes made
-- Remove old images after successful stability period (e.g., 2 weeks)
-- Share lessons learned with team
+```ini
+[webserver]
+rbac = True
+auth_backend = airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
 
-**Key Considerations:**
-- If using AWS MWAA (Managed Workflows for Apache Airflow), upgrade process is different - it's managed by AWS
-- If self-hosted on ECS/EKS, coordinate with your orchestration platform's deployment strategy
-- Plan for extended testing period - Airflow upgrades can surface subtle issues
-- Consider blue-green deployment if downtime must be minimized
+[fab]
+auth_type = AUTH_OAUTH
+oauth_providers = [
+    {
+        'name': 'your_provider',
+        'icon': 'fa-circle-o',
+        'token_key': 'access_token',
+        'remote_app': {
+            'client_id': 'YOUR_CLIENT_ID',
+            'client_secret': 'YOUR_CLIENT_SECRET',
+            'api_base_url': 'https://your-oauth-provider.com/api/',
+            'client_kwargs': {
+                'scope': 'openid profile email'
+            },
+            'access_token_url': 'https://your-oauth-provider.com/oauth/token',
+            'authorize_url': 'https://your-oauth-provider.com/oauth/authorize',
+            'request_token_url': None,
+        }
+    }
+]
+```
 
-Would you like me to elaborate on any specific section, or do you need details about your particular AWS deployment setup (MWAA vs self-hosted)?
+### 3. Create a Custom Security Manager
+
+You'll likely still need a custom security manager in `webserver_config.py`:
+
+```python
+from airflow.providers.fab.auth_manager.security_manager.override import FabAirflowSecurityManagerOverride
+from flask_appbuilder.security.manager import AUTH_OAUTH
+
+class CustomSecurityManager(FabAirflowSecurityManagerOverride):
+    
+    def oauth_user_info(self, provider, response=None):
+        """
+        Get user info from OAuth provider
+        """
+        if provider == 'your_provider':
+            # Extract user info from your OAuth provider's response
+            me = self.appbuilder.sm.oauth_remotes[provider].get('userinfo')
+            data = me.json()
+            
+            return {
+                'username': data.get('preferred_username'),
+                'email': data.get('email'),
+                'first_name': data.get('given_name'),
+                'last_name': data.get('family_name'),
+                'role_keys': data.get('roles', [])  # Your role mapping
+            }
+
+SECURITY_MANAGER_CLASS = CustomSecurityManager
+```
+
+### 4. Role Mapping
+
+Map OAuth roles to Airflow roles in your security manager:
+
+```python
+def auth_user_oauth(self, userinfo):
+    """
+    Map OAuth roles to Airflow roles
+    """
+    user = super().auth_user_oauth(userinfo)
+    
+    # Custom role mapping logic
+    oauth_roles = userinfo.get('role_keys', [])
+    airflow_roles = []
+    
+    if 'admin' in oauth_roles:
+        airflow_roles.append(self.find_role('Admin'))
+    elif 'viewer' in oauth_roles:
+        airflow_roles.append(self.find_role('Viewer'))
+    else:
+        airflow_roles.append(self.find_role('Public'))
+    
+    user.roles = airflow_roles
+    self.update_user(user)
+    
+    return user
+```
+
+## Important Notes for Airflow 3.0
+
+1. **Provider Package**: Make sure you have the correct version of `apache-airflow-providers-fab` installed that's compatible with Airflow 3.0
+
+2. **Auth Manager**: The auth manager configuration has changed slightly - ensure you're pointing to the FAB auth manager from the provider package
+
+3. **Migration Path**: If migrating from 2.11, your existing OAuth configuration should mostly work, but test thoroughly in a non-production environment first
+
+Would you like me to search for the most current documentation on specific OAuth provider configurations (like Okta, Azure AD, Google, etc.) for Airflow 3.0?
