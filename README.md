@@ -1,147 +1,122 @@
-The configuration for external OAuth providers in Airflow 3.0 with `apache-airflow-providers-fab` is quite similar to Airflow 2.x, but there are some important changes to be aware of.
+Here's how to build Option 3 step by step:
 
-## Key Changes in Airflow 3.0
+## Step 1: Inspect the Original Image
 
-In Airflow 3.0, FAB (Flask-AppBuilder) has been moved to a separate provider package (`apache-airflow-providers-fab`), but the OAuth configuration approach remains largely the same.
-
-## Configuration Steps
-
-Here's how to configure external OAuth in Airflow 3.0:
-
-### 1. Install the FAB Provider
+First, let's see what's in the mock-oauth2-server image:
 
 ```bash
-pip install apache-airflow-providers-fab
+docker pull ghcr.io/navikt/mock-oauth2-server:3.0.0
+docker inspect ghcr.io/navikt/mock-oauth2-server:3.0.0
 ```
 
-### 2. Configure airflow.cfg
-
-```ini
-[webserver]
-rbac = True
-auth_backend = airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-
-[fab]
-auth_type = AUTH_OAUTH
-oauth_providers = [
-    {
-        'name': 'your_provider',
-        'icon': 'fa-circle-o',
-        'token_key': 'access_token',
-        'remote_app': {
-            'client_id': 'YOUR_CLIENT_ID',
-            'client_secret': 'YOUR_CLIENT_SECRET',
-            'api_base_url': 'https://your-oauth-provider.com/api/',
-            'client_kwargs': {
-                'scope': 'openid profile email'
-            },
-            'access_token_url': 'https://your-oauth-provider.com/oauth/token',
-            'authorize_url': 'https://your-oauth-provider.com/oauth/authorize',
-            'request_token_url': None,
-        }
-    }
-]
+Check the entrypoint and working directory:
+```bash
+docker inspect ghcr.io/navikt/mock-oauth2-server:3.0.0 | grep -A 5 "Entrypoint\|WorkingDir\|Cmd"
 ```
 
-### 3. Create a Custom Security Manager
+## Step 2: Create the Dockerfile
 
-You'll likely still need a custom security manager in `webserver_config.py`:
+Create a file named `Dockerfile`:
 
-```python
-from airflow.providers.fab.auth_manager.security_manager.override import FabAirflowSecurityManagerOverride
-from flask_appbuilder.security.manager import AUTH_OAUTH
+```dockerfile
+FROM debian:12-slim
 
-class CustomSecurityManager(FabAirflowSecurityManagerOverride):
-    
-    def oauth_user_info(self, provider, response=None):
-        """
-        Get user info from OAuth provider
-        """
-        if provider == 'your_provider':
-            # Extract user info from your OAuth provider's response
-            me = self.appbuilder.sm.oauth_remotes[provider].get('userinfo')
-            data = me.json()
-            
-            return {
-                'username': data.get('preferred_username'),
-                'email': data.get('email'),
-                'first_name': data.get('given_name'),
-                'last_name': data.get('family_name'),
-                'role_keys': data.get('roles', [])  # Your role mapping
-            }
+# Install Java 17 and update all packages including OpenSSL
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y openjdk-17-jre-headless ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-SECURITY_MANAGER_CLASS = CustomSecurityManager
+# Copy application files from the original image
+COPY --from=ghcr.io/navikt/mock-oauth2-server:3.0.0 / /
+
+# Set working directory (adjust if needed based on inspect results)
+WORKDIR /app
+
+# Expose port (mock-oauth2-server typically uses 8080)
+EXPOSE 8080
+
+# Use the same entrypoint as original image
+# You'll need to adjust this based on the inspect output
+ENTRYPOINT ["java", "-jar", "/app/mock-oauth2-server.jar"]
 ```
 
-### 4. Role Mapping
+## Step 3: Find the Correct Entrypoint
 
-Map OAuth roles to Airflow roles in your security manager:
+Run a temporary container to explore the filesystem:
 
-```python
-def auth_user_oauth(self, userinfo):
-    """
-    Map OAuth roles to Airflow roles
-    """
-    user = super().auth_user_oauth(userinfo)
-    
-    # Custom role mapping logic
-    oauth_roles = userinfo.get('role_keys', [])
-    airflow_roles = []
-    
-    if 'admin' in oauth_roles:
-        airflow_roles.append(self.find_role('Admin'))
-    elif 'viewer' in oauth_roles:
-        airflow_roles.append(self.find_role('Viewer'))
-    else:
-        airflow_roles.append(self.find_role('Public'))
-    
-    user.roles = airflow_roles
-    self.update_user(user)
-    
-    return user
+```bash
+docker run --rm -it --entrypoint /bin/sh ghcr.io/navikt/mock-oauth2-server:3.0.0
 ```
 
-## Important Notes for Airflow 3.0
+Since distroless doesn't have a shell, try this instead:
 
-1. **Provider Package**: Make sure you have the correct version of `apache-airflow-providers-fab` installed that's compatible with Airflow 3.0
+```bash
+# Save the image filesystem
+docker create --name temp ghcr.io/navikt/mock-oauth2-server:3.0.0
+docker export temp > mock-oauth2-server.tar
+docker rm temp
 
-2. **Auth Manager**: The auth manager configuration has changed slightly - ensure you're pointing to the FAB auth manager from the provider package
+# Extract and explore
+mkdir extracted
+tar -xf mock-oauth2-server.tar -C extracted
+ls -la extracted/
+find extracted/ -name "*.jar"
+```
 
-3. **Migration Path**: If migrating from 2.11, your existing OAuth configuration should mostly work, but test thoroughly in a non-production environment first
+## Step 4: Update Dockerfile with Correct Paths
 
-Yes, there are several known bugs and issues with OAuth authentication in Airflow 3.0 when using the `apache-airflow-providers-fab` package:
+Based on what you find, update the Dockerfile. It likely looks something like:
 
-## Critical Issues
+```dockerfile
+FROM debian:12-slim
 
-### 1. **HTTP vs HTTPS Redirect URI Problem** (Issue #49781)
-The removal of the `AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX` configuration option in Airflow 3.0 has broken OAuth sign-in with FAB. The redirect URI is being generated with HTTP instead of HTTPS, causing authentication failures due to redirect URI mismatches.
+# Install Java 17 and update all packages including OpenSSL
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y openjdk-17-jre-headless ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-**Workaround**: In Airflow 2.x, this was solved by setting `AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX = True`, but this option was removed in 3.0, leaving OAuth broken for deployments behind reverse proxies.
+# Copy the JAR and any config files
+COPY --from=ghcr.io/navikt/mock-oauth2-server:3.0.0 /app /app
 
-### 2. **Google OAuth Login Issues** (Issue #52226)
-Users report being unable to login using FAB with Google OAuth in Airflow 3.0.2, encountering JWT token validation errors with the message "JWT token is not valid: The specified alg value is not allowed".
+WORKDIR /app
 
-### 3. **API Authentication Confusion** (Issue #50684)
-There's confusion about how API authentication works in Airflow 3.0 with the FAB provider. The `requires_authentication` decorator in custom API authentication backends appears to have become obsolete, and the documentation may be outdated regarding proper implementation methods.
+EXPOSE 8080
 
-### 4. **Database Users Cannot Authenticate with OAuth Configured** (Issue #51662)
-When OAuth is configured as the primary authentication type, users created via the CLI command cannot authenticate through the API, even when basic auth backend is properly configured.
+# Adjust the JAR name based on what you found
+ENTRYPOINT ["java", "-jar", "mock-oauth2-server.jar"]
+```
 
-### 5. **LDAP JWT Token Generation Fails** (Issue #52103)
-LDAP users cannot generate JWT tokens via the `/auth/token` endpoint in Airflow 3.0 with FAB auth manager, even though they can successfully log in through the web UI.
+## Step 5: Build Your Image
 
-### 6. **Missing Dependencies**
-The `authlib` module is required for OAuth but may not be automatically installed, causing import errors.
+```bash
+docker build -t mock-oauth2-server:3.0.0-patched .
+```
 
-## Recommendations
+## Step 6: Test the Image
 
-1. **Monitor Issue #49781** closely - this is the most critical issue affecting OAuth deployments behind proxies
-2. **Test thoroughly** in a non-production environment before migrating
-3. Consider these workarounds:
-   - For proxy issues: May need custom middleware to handle `X-Forwarded-Proto` headers
-   - For missing dependencies: Explicitly install `authlib` package
-4. **Check the redirect URI path** - In Airflow 3.0, the OAuth callback path changed from `/oauth-authorized/{provider}` to `/auth/oauth-authorized/{provider}`, so you'll need to update your OAuth provider configuration
+```bash
+docker run -p 8080:8080 mock-oauth2-server:3.0.0-patched
+```
 
-Would you like me to search for more specific information about any of these issues or look for potential workarounds?
+## Step 7: Verify OpenSSL is Updated
 
-Would you like me to search for the most current documentation on specific OAuth provider configurations (like Okta, Azure AD, Google, etc.) for Airflow 3.0?
+```bash
+docker run --rm --entrypoint java mock-oauth2-server:3.0.0-patched -version
+docker run --rm --entrypoint dpkg mock-oauth2-server:3.0.0-patched -l | grep openssl
+```
+
+## Step 8: Scan for Vulnerabilities
+
+```bash
+# Using Docker Scout
+docker scout cves mock-oauth2-server:3.0.0-patched
+
+# Or using Trivy
+trivy image mock-oauth2-server:3.0.0-patched
+```
+
+**Need help with any of these steps?** Let me know what you find from the inspect command and I can refine the Dockerfile for you.
