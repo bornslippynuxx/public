@@ -65,3 +65,14 @@ EXPOSE 8080
 CMD ["airflow", "api-server"]
 
 ```
+
+
+```
+# Step 2: install FAB and its transitive deps that the broken
+#         constraint file failed to pull in
+RUN pip install \
+        "apache-airflow-providers-fab" \
+        "connexion[flask]" \
+        "flask-appbuilder" \
+        "flask-session<0.6.0"
+```
