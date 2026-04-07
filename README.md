@@ -1,158 +1,67 @@
-```bash
-# ---------------------------------------------------------------------------
-# Fill in your migration command here
-# ---------------------------------------------------------------------------
-run_migration() {
-  echo "run_migration() not implemented."
-  return 1
-}
+```dockerfile
+FROM amazonlinux:2023
 
-# ---------------------------------------------------------------------------
-# rds_migrate --instance-id <id> --region <region>
-# ---------------------------------------------------------------------------
-rds_migrate() {
-  local instance_id="" region="" db_json="" snapshot_id=""
+ARG AIRFLOW_VERSION=3.1.8
+ARG PYTHON_VERSION=3.13
+ARG PYTHON_FULL_VERSION=3.13.1
+ARG AIRFLOW_HOME=/opt/airflow
+ARG AIRFLOW_USER=airflow
 
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --instance-id) instance_id="$2"; shift 2 ;;
-      --region)      region="$2";      shift 2 ;;
-      *) echo "Usage: rds_migrate --instance-id <id> --region <region>"; return 1 ;;
-    esac
-  done
+ENV AIRFLOW_HOME=${AIRFLOW_HOME} \
+    PATH="/usr/local/bin:${PATH}" \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-  [[ -z "${instance_id}" ]] && { echo "--instance-id is required"; return 1; }
-  [[ -z "${region}" ]]      && { echo "--region is required";      return 1; }
+# Build deps for CPython + common Airflow C extensions
+RUN dnf -y update && \
+    dnf -y groupinstall "Development Tools" && \
+    dnf -y install \
+        gcc gcc-c++ make \
+        openssl-devel bzip2-devel libffi-devel zlib-devel \
+        xz-devel ncurses-devel readline-devel sqlite-devel \
+        tk-devel gdbm-devel \
+        libpq-devel \
+        tar gzip wget which shadow-utils \
+        krb5-devel cyrus-sasl-devel libxml2-devel libxslt-devel && \
+    dnf clean all
 
-  command -v aws > /dev/null || { echo "aws CLI not found"; return 1; }
-  command -v jq  > /dev/null || { echo "jq not found";     return 1; }
+# Build Python 3.13 from source
+RUN cd /tmp && \
+    wget -q https://www.python.org/ftp/python/${PYTHON_FULL_VERSION}/Python-${PYTHON_FULL_VERSION}.tgz && \
+    tar xzf Python-${PYTHON_FULL_VERSION}.tgz && \
+    cd Python-${PYTHON_FULL_VERSION} && \
+    ./configure --enable-optimizations --enable-shared \
+                --with-system-ffi LDFLAGS="-Wl,-rpath=/usr/local/lib" && \
+    make -j"$(nproc)" && \
+    make altinstall && \
+    ln -sf /usr/local/bin/python${PYTHON_VERSION} /usr/local/bin/python3 && \
+    ln -sf /usr/local/bin/python${PYTHON_VERSION} /usr/local/bin/python && \
+    ln -sf /usr/local/bin/pip${PYTHON_VERSION} /usr/local/bin/pip3 && \
+    ln -sf /usr/local/bin/pip${PYTHON_VERSION} /usr/local/bin/pip && \
+    cd / && rm -rf /tmp/Python-${PYTHON_FULL_VERSION}*
 
-  snapshot_id="pre-migration-${instance_id}-$(date +%Y%m%d%H%M%S)"
+# Create airflow user
+RUN useradd -ms /bin/bash -d ${AIRFLOW_HOME} ${AIRFLOW_USER}
 
-  # --- Introspect ----------------------------------------------------------
-  echo "Fetching instance config: ${instance_id}"
-  db_json=$(aws rds describe-db-instances \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}" \
-    --query 'DBInstances[0]' \
-    --output json) || { echo "Could not describe instance '${instance_id}'"; return 1; }
+# Upgrade pip tooling
+RUN pip install --upgrade pip setuptools wheel
 
-  # --- Snapshot ------------------------------------------------------------
-  echo "Creating snapshot: ${snapshot_id}"
-  aws rds create-db-snapshot \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}" \
-    --db-snapshot-identifier "${snapshot_id}" \
-    --output text > /dev/null
-  aws rds wait db-snapshot-available \
-    --region "${region}" \
-    --db-snapshot-identifier "${snapshot_id}"
-  echo "Snapshot ready."
+# Step 1: install Airflow with the official constraint file
+#         (the 3.13 file is missing the FAB pin — that's expected)
+RUN CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt" && \
+    pip install "apache-airflow[amazon,postgres,celery,cncf.kubernetes]==${AIRFLOW_VERSION}" \
+        --constraint "${CONSTRAINT_URL}"
 
-  # --- Migrate -------------------------------------------------------------
-  set +e; run_migration; local exit_code=$?; set -e
+# Step 2: install the FAB provider WITHOUT the constraint file
+#         (constraint omits it; let pip resolve a compatible version)
+RUN pip install "apache-airflow-providers-fab"
 
-  [[ ${exit_code} -eq 0 ]] && { echo "Migration succeeded."; return 0; }
+# Sanity check — fail the build early if Flask/connexion aren't importable
+RUN python -c "import flask, connexion, airflow.providers.fab; print('ok')"
 
-  # --- Rollback ------------------------------------------------------------
-  echo "Migration failed (exit ${exit_code}). Rolling back..."
+USER ${AIRFLOW_USER}
+WORKDIR ${AIRFLOW_HOME}
+EXPOSE 8080
+CMD ["airflow", "api-server"]
 
-  local deletion_protection
-  deletion_protection=$(echo "${db_json}" | jq -r '.DeletionProtection')
-
-  if [[ "${deletion_protection}" == "true" ]]; then
-    aws rds modify-db-instance \
-      --region "${region}" \
-      --db-instance-identifier "${instance_id}" \
-      --no-deletion-protection \
-      --apply-immediately \
-      --output text > /dev/null
-    sleep 10
-  fi
-
-  aws rds delete-db-instance \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}" \
-    --skip-final-snapshot \
-    --output text > /dev/null
-  aws rds wait db-instance-deleted \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}"
-  echo "Instance deleted."
-
-  # Build restore command from captured config
-  local sg_ids
-  sg_ids=$(echo "${db_json}" | jq -r '[.VpcSecurityGroups[].VpcSecurityGroupId] | join(" ")')
-
-  local multi_az publicly_accessible auto_minor iops db_name option_group ca_cert timezone storage_encrypted kms_key
-  multi_az=$(echo            "${db_json}" | jq -r '.MultiAZ')
-  publicly_accessible=$(echo "${db_json}" | jq -r '.PubliclyAccessible')
-  auto_minor=$(echo          "${db_json}" | jq -r '.AutoMinorVersionUpgrade')
-  iops=$(echo                "${db_json}" | jq -r '.Iops // empty')
-  db_name=$(echo             "${db_json}" | jq -r '.DBName // empty')
-  option_group=$(echo        "${db_json}" | jq -r '.OptionGroupMemberships[0].OptionGroupName // empty')
-  ca_cert=$(echo             "${db_json}" | jq -r '.CACertificateIdentifier // empty')
-  timezone=$(echo            "${db_json}" | jq -r '.Timezone // empty')
-  storage_encrypted=$(echo   "${db_json}" | jq -r '.StorageEncrypted')
-  kms_key=$(echo             "${db_json}" | jq -r '.KmsKeyId // empty')
-
-  local restore_cmd=(
-    aws rds restore-db-instance-from-db-snapshot
-    --region                  "${region}"
-    --db-instance-identifier  "${instance_id}"
-    --db-snapshot-identifier  "${snapshot_id}"
-    --db-instance-class       "$(echo "${db_json}" | jq -r '.DBInstanceClass')"
-    --db-subnet-group-name    "$(echo "${db_json}" | jq -r '.DBSubnetGroup.DBSubnetGroupName')"
-    --vpc-security-group-ids  ${sg_ids}
-    --engine-version          "$(echo "${db_json}" | jq -r '.EngineVersion')"
-    --port                    "$(echo "${db_json}" | jq -r '.Endpoint.Port')"
-    --license-model           "$(echo "${db_json}" | jq -r '.LicenseModel')"
-    --storage-type            "$(echo "${db_json}" | jq -r '.StorageType')"
-    --db-parameter-group-name "$(echo "${db_json}" | jq -r '.DBParameterGroups[0].DBParameterGroupName')"
-    --output text
-  )
-
-  [[ "${multi_az}" == "true" ]]            && restore_cmd+=(--multi-az)                  || restore_cmd+=(--no-multi-az)
-  [[ "${publicly_accessible}" == "true" ]] && restore_cmd+=(--publicly-accessible)       || restore_cmd+=(--no-publicly-accessible)
-  [[ "${auto_minor}" == "true" ]]          && restore_cmd+=(--auto-minor-version-upgrade) || restore_cmd+=(--no-auto-minor-version-upgrade)
-  [[ "${deletion_protection}" == "true" ]] && restore_cmd+=(--deletion-protection)       || restore_cmd+=(--no-deletion-protection)
-  [[ -n "${iops}" ]]         && restore_cmd+=(--iops "${iops}")
-  [[ -n "${db_name}" ]]      && restore_cmd+=(--db-name "${db_name}")
-  [[ -n "${option_group}" ]] && restore_cmd+=(--option-group-name "${option_group}")
-  [[ -n "${ca_cert}" ]]      && restore_cmd+=(--ca-certificate-identifier "${ca_cert}")
-  [[ -n "${timezone}" ]]     && restore_cmd+=(--timezone "${timezone}")
-  [[ "${storage_encrypted}" == "true" && -n "${kms_key}" ]] && restore_cmd+=(--kms-key-id "${kms_key}")
-
-  echo "Restoring instance..."
-  "${restore_cmd[@]}" > /dev/null
-  aws rds wait db-instance-available \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}"
-
-  # Re-apply tags
-  local tags_json restored_arn
-  tags_json=$(aws rds list-tags-for-resource \
-    --region "${region}" \
-    --resource-name "$(echo "${db_json}" | jq -r '.DBInstanceArn')" \
-    --query 'TagList' --output json)
-  restored_arn=$(aws rds describe-db-instances \
-    --region "${region}" \
-    --db-instance-identifier "${instance_id}" \
-    --query 'DBInstances[0].DBInstanceArn' --output text)
-  [[ "$(echo "${tags_json}" | jq 'length')" -gt 0 ]] && \
-    aws rds add-tags-to-resource \
-      --region "${region}" \
-      --resource-name "${restored_arn}" \
-      --tags "$(echo "${tags_json}" | jq -c '.')" \
-      --output text > /dev/null
-
-  echo "Rollback complete."
-  return 1
-}
-
-# Run directly if executed as a script (not sourced)
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  set -euo pipefail
-  rds_migrate "$@"
-fi
 ```
