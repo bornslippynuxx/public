@@ -166,3 +166,21 @@ EXPOSE 8080
 CMD ["airflow", "api-server"]
 
 ```
+```
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/aquasecurity/trivy:latest image airflow-3.2.0-py3.13
+That mounts your Docker socket so Trivy can access local images. Useful flags:
+
+--severity CRITICAL,HIGH — only show critical/high
+--scanners vuln — skip misconfig/secret scanning, just vulnerabilities
+--format table (default) or --format json for machine-readable output
+--ignore-unfixed — hide CVEs with no available fix
+Full example:
+
+
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/aquasecurity/trivy:latest image \
+  --severity CRITICAL,HIGH \
+  --scanners vuln \
+  airflow-3.2.0-py3.13
+```
