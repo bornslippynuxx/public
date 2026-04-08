@@ -81,7 +81,7 @@ RUN pip install \
 
 
 ```
-ARG AIRFLOW_VERSION=3.1.8
+ARG AIRFLOW_VERSION=3.2.0
 ARG PYTHON_VERSION=3.13
 ARG PYTHON_FULL_VERSION=3.13.12
 
@@ -132,59 +132,27 @@ RUN useradd -m -d /opt/airflow -s /bin/bash airflow
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # ---------------------------------------------------------------------------
-# Step A: Install Airflow with the (incomplete) Python 3.13 constraints
+# Install Airflow with Python 3.13 constraints (FAB is included in 3.2.0+)
 # ---------------------------------------------------------------------------
 RUN pip install --no-cache-dir \
     "apache-airflow[amazon,postgres,celery,cncf.kubernetes]==${AIRFLOW_VERSION}" \
+    "apache-airflow-providers-fab" \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
 # ---------------------------------------------------------------------------
-# Step B: FAB provider + Flask 2.x dependency tree — WORKAROUND
-#
-# The official constraints-3.13.txt for Airflow 3.1.8 is missing
-# apache-airflow-providers-fab and its entire Flask 2.x transitive dependency
-# tree. This causes the api-server to fail at startup with:
-#
-#   ModuleNotFoundError: No module named 'connexion'
-#
-# The packages themselves support Python 3.13 — only the constraint-file
-# generation is broken. We pull the exact pins from the Python 3.12
-# constraints file, which is known-good.
-#
-# Upstream issues:
-#   https://github.com/apache/airflow/issues/57471
-#   https://github.com/apache/airflow/issues/56123
-#
-# TODO: Remove this step once upstream ships a corrected constraints-3.13.txt.
+# Remove dev-only manifests shipped in the FAB provider package.
+# pnpm-lock.yaml references flatted and lodash as transitive devDependencies
+# of webpack/eslint — they are not in the runtime JS bundles, but image
+# scanners flag the lockfile. Safe to delete.
 # ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir \
-    "apache-airflow-providers-fab==3.4.0" \
-    "Flask==2.2.5" \
-    "Werkzeug==2.2.3" \
-    "Flask-AppBuilder==5.0.1" \
-    "Flask-Babel==4.0.0" \
-    "Flask-JWT-Extended==4.7.1" \
-    "Flask-Login==0.6.3" \
-    "Flask-Session==0.8.0" \
-    "Flask-SQLAlchemy==3.1.1" \
-    "Flask-WTF==1.2.2" \
-    "WTForms==3.2.1" \
-    "connexion[flask]==2.14.2" \
-    "apispec==6.10.0" \
-    "cachelib==0.13.0" \
-    "clickclick==20.10.2" \
-    "colorama==0.4.6" \
-    "importlib_resources==6.5.2" \
-    "jsonpickle==3.4.2" \
-    "marshmallow-sqlalchemy==1.4.2" \
-    "prison==0.2.1" \
-    "cachetools==7.0.3"
+RUN rm -f /usr/local/lib/python3.13/site-packages/airflow/providers/fab/www/pnpm-lock.yaml \
+          /usr/local/lib/python3.13/site-packages/airflow/providers/fab/www/package.json
 
 # ---------------------------------------------------------------------------
 # Sanity check — fail the build fast if key imports are missing
 # ---------------------------------------------------------------------------
 RUN python -c "\
-import flask, connexion, flask_appbuilder, flask_login, flask_session; \
+import flask, flask_appbuilder, flask_login, flask_session; \
 from airflow.providers.fab.auth_manager.fab_auth_manager import FabAuthManager; \
 print('ok')"
 
