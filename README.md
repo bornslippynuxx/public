@@ -184,3 +184,26 @@ docker run --rm \
   --scanners vuln \
   airflow-3.2.0-py3.13
 ```
+
+```
+RUN rm -rf /usr/local/lib/python3.13/site-packages/flask_appbuilder/static/appbuilder/js/swagger-ui*
+```
+
+```
+docker run --rm --entrypoint bash airflow-3.2.0-py3.13 -c "
+echo '=== Searching for flatted/lodash files ==='
+find / -iname '*flatted*' -o -iname '*lodash*' 2>/dev/null
+
+echo ''
+echo '=== Searching for lockfiles/package.json ==='
+find / -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'package-lock.json' -o -name 'package.json' 2>/dev/null
+
+echo ''
+echo '=== Searching file contents for flatted/lodash ==='
+grep -rl 'flatted\|lodash' /usr/local/lib/ 2>/dev/null || echo 'No matches found in /usr/local/lib/'
+
+echo ''
+echo '=== Checking node_modules ==='
+find / -type d -name 'node_modules' 2>/dev/null || echo 'No node_modules directories found'
+"
+```
