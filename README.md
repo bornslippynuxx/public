@@ -181,3 +181,14 @@ Or paste into the CloudWatch console → Dashboards → Actions → View/edit so
 When a node goes down, you'll see the top row drop (running tasks, instance count), the middle row often spikes just before (memory/CPU pressure causing OOM kills), and the bottom-left chart will show the error spike in the app stream at the same timestamp. The stop-reason table tells you whether it was `EssentialContainerExited` (app crash), `TaskFailedToStart` (infra problem), or scheduler/user-initiated (deploy or drain).
 
 If your EventBridge → CW Logs pipe isn't set up yet, the two bottom-row event widgets will be empty — let me know and I can give you the EventBridge rule JSON too.
+
+
+
+
+fields @timestamp, @log, @message
+| filter (Type = "Service" and ServiceName = "your-service-name")
+       or @message like /YourSpecificErrorMessage/
+| stats avg(RunningTaskCount) as running_tasks,
+        sum(strcontains(@message, "YourSpecificErrorMessage")) as error_count
+        by bin(1m)
+| sort @timestamp asc
