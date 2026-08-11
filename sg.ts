@@ -74,6 +74,23 @@ export interface AirflowSecurityGroupsProps {
    */
   readonly useRdsProxy?: boolean;
 
+  /**
+   * 'elasticache' in upper envs, 'container' in lower envs where Redis runs as
+   * its own Fargate service. Only affects what redisSg is attached to and
+   * whether the NLB hop exists — the client-side rules are identical either
+   * way, which is what keeps the broker URL shape consistent across envs.
+   */
+  readonly brokerMode: 'elasticache' | 'container';
+
+  /**
+   * Put an NLB in the broker path. Defaults to true for 'container' and false
+   * for 'elasticache' — ElastiCache already publishes a primary endpoint that
+   * follows failover, so an NLB in front of it would be a liability rather
+   * than an abstraction. Only override if something outside the VPC needs the
+   * broker.
+   */
+  readonly brokerViaNlb?: boolean;
+
   /** Flower is an extra attack surface. Off unless you actively use it. */
   readonly enableFlower?: boolean;
 
@@ -113,6 +130,17 @@ export class AirflowSecurityGroups extends Construct {
   public readonly opsSg: ec2.SecurityGroup;
   public readonly rdsSg: ec2.SecurityGroup;
   public readonly rdsProxySg?: ec2.SecurityGroup;
+  /**
+   * Present only when brokerViaNlb. MUST be passed to the NLB at creation
+   * time — NLB security groups cannot be associated after the fact, so an
+   * existing NLB without one has to be replaced.
+   */
+  public readonly redisNlbSg?: ec2.SecurityGroup;
+
+  /**
+   * Attached to the ElastiCache replication group in upper envs, or to the
+   * Redis Fargate service in lower envs. Same SG either way.
+   */
   public readonly redisSg: ec2.SecurityGroup;
   public readonly vpceSg: ec2.SecurityGroup;
 
@@ -159,7 +187,18 @@ export class AirflowSecurityGroups extends Construct {
     this.workerSg = sg('Worker', 'celery worker tasks — no metadata DB access');
     this.opsSg = sg('Ops', 'one-shot ops CLI / db migration tasks');
     this.rdsSg = sg('Rds', 'RDS PostgreSQL metadata database');
-    this.redisSg = sg('Redis', 'ElastiCache Redis celery broker');
+    // Only exists in container mode. MUST be passed to the NLB at creation
+    // time — NLB security groups cannot be associated after the fact, so an
+    // existing NLB without one has to be replaced.
+    if (props.brokerViaNlb ?? props.brokerMode === 'container') {
+      this.redisNlbSg = sg('RedisNlb', 'NLB fronting the redis container');
+    }
+    this.redisSg = sg(
+      'Redis',
+      props.brokerMode === 'elasticache'
+        ? 'ElastiCache replication group (celery broker)'
+        : 'redis container service (celery broker)',
+    );
     this.vpceSg = sg('Vpce', 'interface VPC endpoints');
 
     if (props.useRdsProxy) {
@@ -190,7 +229,7 @@ export class AirflowSecurityGroups extends Construct {
     this.wireUiPath(props);
     this.wireExecutionApiPath();
     this.wireDatabasePath(props);
-    this.wireBrokerPath();
+    this.wireBrokerPath(props);
     this.wireEndpointPath();
     this.wireScrapePath(props);
   }
@@ -289,17 +328,54 @@ export class AirflowSecurityGroups extends Construct {
 
   // -- celery broker -------------------------------------------------------
 
-  private wireBrokerPath() {
+  private wireBrokerPath(props: AirflowSecurityGroupsProps) {
     // Scheduler publishes (the CeleryExecutor runs in-process), workers consume.
     //
     // Workers appear here and NOT on the database path. That only holds if
     // [celery] result_backend points at Redis. Leave it at the db+postgresql://
     // default and workers will need 5432, and the AIP-72 boundary is gone.
-    for (const client of [this.schedulerSg, this.workerSg]) {
+    const brokerClients = [this.schedulerSg, this.workerSg];
+
+    if (this.redisNlbSg) {
+      // Two hops: task SG -> NLB SG -> broker SG.
+      //
+      // Security group referencing works regardless of the client IP
+      // preservation setting, which matters because IP-type TCP target groups
+      // default it to off — the broker would otherwise see only the NLB's
+      // private IPs and you'd be back to allowlisting subnet CIDRs.
+      for (const client of brokerClients) {
+        this.redisNlbSg.connections.allowFrom(
+          client,
+          PORT.redis,
+          `${client.node.id} -> redis NLB`,
+        );
+      }
       this.redisSg.connections.allowFrom(
-        client,
+        this.redisNlbSg,
         PORT.redis,
-        `${client.node.id} -> redis broker`,
+        `redis NLB -> ${props.brokerMode} (includes health checks)`,
+      );
+    } else {
+      // Upper envs: tasks connect straight to the ElastiCache primary
+      // endpoint. One hop, no idle timeout to tune, and failover is handled
+      // by ElastiCache's own DNS rather than by target re-registration.
+      for (const client of brokerClients) {
+        this.redisSg.connections.allowFrom(
+          client,
+          PORT.redis,
+          `${client.node.id} -> ElastiCache primary endpoint`,
+        );
+      }
+    }
+
+    // In container mode the Redis service is itself a Fargate task and needs
+    // the endpoint path for image pulls and log shipping. ElastiCache is a
+    // managed service and needs nothing.
+    if (props.brokerMode === 'container') {
+      this.vpceSg.connections.allowFrom(
+        this.redisSg,
+        PORT.https,
+        'redis container -> interface VPC endpoints',
       );
     }
   }
@@ -367,6 +443,10 @@ export interface AirflowEnvConfig {
   readonly apiServerCount: number;
   readonly enableFlower: boolean;
   readonly useRdsProxy: boolean;
+  readonly brokerMode: 'elasticache' | 'container';
+  readonly brokerViaNlb: boolean;
+  /** ElastiCache encryption in transit. Forces rediss:// + broker_use_ssl. */
+  readonly brokerTls: boolean;
 }
 
 export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
@@ -378,6 +458,9 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     apiServerCount: 1,
     enableFlower: true,
     useRdsProxy: false,
+    brokerMode: 'container',
+    brokerViaNlb: true,
+    brokerTls: false, // <- the divergence that will bite you; see notes
   },
   staging: {
     envName: 'staging',
@@ -388,6 +471,9 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     apiServerCount: 2,
     enableFlower: false,
     useRdsProxy: true,
+    brokerMode: 'elasticache',
+    brokerViaNlb: false, // ElastiCache primary endpoint, no NLB
+    brokerTls: true,
   },
   prod: {
     envName: 'prod',
@@ -397,6 +483,9 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     apiServerCount: 2,
     enableFlower: false,
     useRdsProxy: true,
+    brokerMode: 'elasticache',
+    brokerViaNlb: false, // ElastiCache primary endpoint, no NLB
+    brokerTls: true,
   },
 };
 
@@ -430,3 +519,88 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 //     version: rds.PostgresEngineVersion.VER_16_4,
 //   }),
 // });
+//
+// --- Redis NLB (LOWER ENVS ONLY) -------------------------------------------
+//
+// Upper envs skip all of this and point the broker URL at the ElastiCache
+// primary endpoint. sgs.redisNlbSg is undefined there.
+//
+// if (sgs.redisNlbSg) {
+//   const redisNlb = new elbv2.NetworkLoadBalancer(this, 'RedisNlb', {
+//     vpc,
+//     internetFacing: false,
+//     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+//     securityGroups: [sgs.redisNlbSg], // creation-time only, cannot be added later
+//   });
+//   const listener = redisNlb.addListener('RedisListener', { port: 6379 });
+//
+//   // The generic service() helper above uses 100/200 for rolling deploys.
+//   // Do NOT do that here. Two redis containers behind one target group means
+//   // two independent brokers, and queued messages on the departing one go
+//   // invisible — tasks appear to vanish. Force one-at-a-time instead:
+//   const redisService = new ecs.FargateService(this, 'Redis', {
+//     cluster,
+//     taskDefinition: redisTask,
+//     desiredCount: 1,
+//     securityGroups: [sgs.redisSg],
+//     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+//     minHealthyPercent: 0,   // brief broker outage, correct behaviour
+//     maxHealthyPercent: 100, // never two brokers at once
+//   });
+//
+//   // ECS registers and deregisters task IPs itself, so targets stay current
+//   // across redeploys with no extra machinery.
+//   redisService.registerLoadBalancerTargets({
+//     containerName: 'redis',
+//     containerPort: 6379,
+//     newTargetGroupId: 'RedisTg',
+//     listener: ecs.ListenerConfig.networkListener(listener),
+//   });
+// }
+//
+// The NLB's 350s TCP idle timeout applies only in these lower envs. Celery
+// workers hold idle broker connections while polling, so set socket_keepalive
+// below that threshold — otherwise dev shows worker hangs that upper envs
+// never reproduce, which is a confusing way to spend an afternoon.
+//
+// --- Attaching SGs to Fargate services -------------------------------------
+//
+// securityGroups is an array and is set at service creation. Omit it and CDK
+// silently creates its own SG with allowAllOutbound: true, which defeats the
+// entire mesh above — always pass it explicitly.
+//
+// const service = (id: string, taskDef: ecs.FargateTaskDefinition,
+//                  securityGroup: ec2.ISecurityGroup, desiredCount: number) =>
+//   new ecs.FargateService(this, id, {
+//     cluster,
+//     taskDefinition: taskDef,
+//     desiredCount,
+//     securityGroups: [securityGroup],
+//     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+//     assignPublicIp: false,
+//     circuitBreaker: { rollback: true },
+//     minHealthyPercent: 100,
+//     maxHealthyPercent: 200, // note: doubles DB connections mid-deploy
+//   });
+//
+// const apiServer    = service('ApiServer',    apiServerTask,    sgs.apiServerSg,    cfg.apiServerCount);
+// const scheduler    = service('Scheduler',    schedulerTask,    sgs.schedulerSg,    cfg.schedulerCount);
+// const dagProcessor = service('DagProcessor', dagProcessorTask, sgs.dagProcessorSg, 1);
+// const triggerer    = service('Triggerer',    triggererTask,    sgs.triggererSg,    2);
+// const worker       = service('Worker',       workerTask,       sgs.workerSg,       cfg.workerCount);
+//
+// Register the api-server with both listeners; the SG rules already exist.
+//   publicListener.addTargets('ApiServerUi',   { port: 8080, targets: [apiServer] });
+//   execListener.addTargets('ApiServerExec',   { port: 8080, targets: [apiServer] });
+//
+// For one-shot ops tasks (db migrate, backfill) there is no service — the SG
+// is passed at run time instead:
+//   new tasks.EcsRunTask(this, 'DbMigrate', {
+//     ...
+//     securityGroups: [sgs.opsSg],
+//     launchTarget: new tasks.EcsFargateLaunchTarget(),
+//   });
+//
+// Do NOT use ApplicationLoadBalancedFargateService here — it creates and
+// manages its own SG, and you lose the ability to pin the api-server to
+// apiServerSg. Compose the pieces manually.
