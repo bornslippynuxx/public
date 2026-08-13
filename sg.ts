@@ -1,28 +1,50 @@
 /**
  * Airflow 3.2.0 on ECS Fargate — security group mesh.
  *
- * Design rules encoded here:
+ * EGRESS POSTURE
+ * --------------
+ * Every SG is created with allowAllOutbound: true, deliberately.
  *
- *  1. One SG per role. No shared "airflow-common" SG with a self-referencing
- *     rule — that would silently undo the AIP-72 boundary at the network layer.
+ * This VPC has no NAT gateway. Private subnets have no route to the internet,
+ * so SG egress rules would duplicate a constraint the route tables already
+ * enforce — at the cost of ~20 extra rules and a recurring failure mode where
+ * a missing rule presents as a task hanging until timeout with nothing useful
+ * in the logs.
  *
- *  2. Workers have NO path to the metadata DB. In Airflow 3 only the control
- *     plane (scheduler, api-server, dag-processor, triggerer) touches Postgres.
- *     Workers reach the Task Execution API over the internal ALB.
- *     If you see a 5432 rule referencing workerSg, something regressed.
+ * The security argument rests entirely on INGRESS, which is unchanged:
  *
- *  3. Every SG is constructed with allowAllOutbound: false. This is immutable
- *     after construction — addEgressRule on an allowAllOutbound SG is ignored.
+ *   - Workers cannot reach the metadata database. rdsSg does not accept them.
+ *     Unrestricted worker egress does not help a worker find a listener that
+ *     isn't there. This is the AIP-72 boundary and it is intact.
+ *   - The UI is reachable only from operator laptops, via the public ALB.
+ *   - The Task Execution API is reachable only from inside, via the internal ALB.
  *
- *  4. Two-pass wiring. All SGs are constructed first, then rules are attached.
- *     Interleaving construction and cross-references is how you end up with a
- *     CloudFormation circular dependency.
+ * What this posture does NOT cover, and what must be controlled elsewhere:
  *
- *  5. Sidecars (statsd-exporter, ADOT collector) share the task ENI. Their
- *     ports are loopback and deliberately have no SG rules.
+ *   1. The S3 GATEWAY ENDPOINT has no security group. A task can PutObject to
+ *      any bucket in the region, including outside this account. Constrain it
+ *      with an endpoint policy (aws:PrincipalOrgID, or a bucket allowlist).
+ *      With no NAT, this is the primary remaining exfiltration path.
+ *   2. TRANSIT GATEWAY / DIRECT CONNECT routes. "No NAT" is not "no egress" if
+ *      a TGW attachment routes toward the corporate network. Confirm the route
+ *      table scope; unrestricted egress plus a broad TGW route is a lateral
+ *      movement path.
+ *   3. IAM. The network boundary must match the permission boundary — check
+ *      whether workers still hold Secrets Manager read for connections.
  *
- *  6. The S3 gateway endpoint has no SG — it is authorized via route table and
- *     endpoint policy, not here.
+ * If a NAT gateway is ever added to this VPC, this decision must be revisited:
+ * workerSg and dagProcessorSg run code this team does not fully control, and
+ * they would need allowAllOutbound: false. Note that the flag is immutable
+ * after construction — flipping it replaces the security group.
+ *
+ * OTHER RULES ENCODED HERE
+ * ------------------------
+ *  - One SG per role. No shared "airflow-common" SG with a self-referencing
+ *    rule, which would undo the AIP-72 boundary at the network layer.
+ *  - Two-pass wiring: construct all SGs, then attach rules. Interleaving the
+ *    two is how you get a CloudFormation circular dependency.
+ *  - Sidecars (statsd-exporter, ADOT) share the task ENI. Their ports are
+ *    loopback and deliberately have no rules.
  */
 
 import { Construct } from 'constructs';
@@ -36,19 +58,17 @@ import { Tags } from 'aws-cdk-lib';
 /**
  * How operator laptops reach the Airflow UI.
  *
- * IMPORTANT: a security group can only reference workloads that have an ENI
- * inside the VPC. Laptops do not. "A security group representing all the
- * laptops" is only expressible in the cases below:
+ * A security group can only reference workloads with an ENI inside the VPC.
+ * Laptops do not have one, so only these variants are expressible:
  *
- *   - clientVpn  : the AWS Client VPN endpoint has its own SG, and traffic from
- *                  connected laptops is sourced from that SG. This is the only
- *                  variant where an SG genuinely represents a fleet of laptops.
- *   - privateLink: an interface endpoint ENI in a consumer VPC, SG-addressable.
- *   - prefixList : laptops arrive over Direct Connect / transit gateway from a
- *                  corporate range. There is no ENI, so no SG. A customer-
- *                  managed prefix list is the correct abstraction — it gives
- *                  you one named object to audit and update, which is as close
- *                  to "a client SG" as this path allows.
+ *   - clientVpn  : the Client VPN endpoint has its own SG and connected
+ *                  laptops source traffic from it. The only variant where an
+ *                  SG genuinely represents a fleet of laptops.
+ *   - privateLink: an interface endpoint ENI in a consumer VPC.
+ *   - prefixList : laptops arrive over Direct Connect / TGW from a corporate
+ *                  range. No ENI, so no SG. A customer-managed prefix list is
+ *                  the correct abstraction — one named, versioned object to
+ *                  audit and update.
  *   - cidr       : escape hatch. Avoid in regulated envs; it scatters ranges
  *                  across rules with no single place to review them.
  */
@@ -61,54 +81,32 @@ export type ClientAccess =
 export interface AirflowSecurityGroupsProps {
   readonly vpc: ec2.IVpc;
 
-  /** 'dev' | 'staging' | 'prod' — used for naming and tagging only. */
+  /** 'dev' | 'staging' | 'prod' — naming and tagging only. */
   readonly envName: string;
 
   readonly clientAccess: ClientAccess;
 
   /**
-   * Route control-plane DB traffic through RDS Proxy. Collapses the RDS
-   * ingress list to a single peer. Measure DatabaseConnectionsCurrentlySession
-   * Pinned before assuming it fixes connection pressure — the scheduler's HA
-   * locking pins sessions.
-   */
-  readonly useRdsProxy?: boolean;
-
-  /**
-   * 'elasticache' in upper envs, 'container' in lower envs where Redis runs as
-   * its own Fargate service. Only affects what redisSg is attached to and
-   * whether the NLB hop exists — the client-side rules are identical either
-   * way, which is what keeps the broker URL shape consistent across envs.
+   * 'elasticache' upper, 'container' lower. Upper envs talk to the primary
+   * endpoint directly; lower envs front a Redis Fargate service with an NLB.
    */
   readonly brokerMode: 'elasticache' | 'container';
 
   /**
-   * Put an NLB in the broker path. Defaults to true for 'container' and false
-   * for 'elasticache' — ElastiCache already publishes a primary endpoint that
-   * follows failover, so an NLB in front of it would be a liability rather
-   * than an abstraction. Only override if something outside the VPC needs the
-   * broker.
+   * Route control-plane DB traffic through RDS Proxy, collapsing the RDS
+   * ingress list to a single peer. Measure
+   * DatabaseConnectionsCurrentlySessionPinned before assuming it relieves
+   * connection pressure — the scheduler's HA locking pins sessions.
    */
-  readonly brokerViaNlb?: boolean;
+  readonly useRdsProxy?: boolean;
 
-  /** Flower is an extra attack surface. Off unless you actively use it. */
-  readonly enableFlower?: boolean;
-
-  /**
-   * Where an external Prometheus scrapes from (it discovers tasks via Cloud
-   * Map and connects to task IPs directly, so the LB is not in this path).
-   */
+  /** Where an external Prometheus scrapes from. */
   readonly prometheusPeer?: ec2.IPeer;
 }
-
-// ---------------------------------------------------------------------------
-// Ports
-// ---------------------------------------------------------------------------
 
 const PORT = {
   https: ec2.Port.tcp(443),
   apiServer: ec2.Port.tcp(8080), // UI + REST API + Task Execution API
-  flower: ec2.Port.tcp(5555),
   postgres: ec2.Port.tcp(5432),
   redis: ec2.Port.tcp(6379),
   metrics: ec2.Port.tcp(9102), // statsd-exporter /metrics
@@ -130,21 +128,25 @@ export class AirflowSecurityGroups extends Construct {
   public readonly opsSg: ec2.SecurityGroup;
   public readonly rdsSg: ec2.SecurityGroup;
   public readonly rdsProxySg?: ec2.SecurityGroup;
+
   /**
-   * Present only when brokerViaNlb. MUST be passed to the NLB at creation
-   * time — NLB security groups cannot be associated after the fact, so an
-   * existing NLB without one has to be replaced.
+   * Container mode only. MUST be passed to the NLB at creation time — NLB
+   * security groups cannot be associated afterwards, so an existing NLB
+   * without one has to be replaced.
    */
   public readonly redisNlbSg?: ec2.SecurityGroup;
 
-  /**
-   * Attached to the ElastiCache replication group in upper envs, or to the
-   * Redis Fargate service in lower envs. Same SG either way.
-   */
+  /** ElastiCache replication group (upper) or Redis service (lower). */
   public readonly redisSg: ec2.SecurityGroup;
+
+  /**
+   * Interface endpoints. With no NAT, this is the ONLY path to the AWS
+   * control plane — an SG rule missing here means no ECR pull, no logs, no
+   * Secrets Manager. Failures look like tasks stuck in PROVISIONING.
+   */
   public readonly vpceSg: ec2.SecurityGroup;
 
-  /** Every SG that runs Airflow application code. */
+  /** Every SG running Airflow application code. */
   public readonly appSgs: ec2.SecurityGroup[];
 
   /** SGs permitted to open a Postgres session. Never includes workerSg. */
@@ -160,8 +162,10 @@ export class AirflowSecurityGroups extends Construct {
         vpc,
         description: `${envName} airflow — ${description}`,
         securityGroupName: `${envName}-airflow-${name.toLowerCase()}`,
-        // Immutable after construction. Do not flip this to true "temporarily".
-        allowAllOutbound: false,
+        // See the egress note at the top of this file. There is no NAT
+        // gateway; route tables carry the egress constraint. Immutable after
+        // construction — changing this replaces the SG.
+        allowAllOutbound: true,
       });
       Tags.of(group).add('airflow:role', name);
       Tags.of(group).add('airflow:env', envName);
@@ -187,19 +191,18 @@ export class AirflowSecurityGroups extends Construct {
     this.workerSg = sg('Worker', 'celery worker tasks — no metadata DB access');
     this.opsSg = sg('Ops', 'one-shot ops CLI / db migration tasks');
     this.rdsSg = sg('Rds', 'RDS PostgreSQL metadata database');
-    // Only exists in container mode. MUST be passed to the NLB at creation
-    // time — NLB security groups cannot be associated after the fact, so an
-    // existing NLB without one has to be replaced.
-    if (props.brokerViaNlb ?? props.brokerMode === 'container') {
-      this.redisNlbSg = sg('RedisNlb', 'NLB fronting the redis container');
-    }
+    this.vpceSg = sg('Vpce', 'interface VPC endpoints');
+
     this.redisSg = sg(
       'Redis',
       props.brokerMode === 'elasticache'
         ? 'ElastiCache replication group (celery broker)'
         : 'redis container service (celery broker)',
     );
-    this.vpceSg = sg('Vpce', 'interface VPC endpoints');
+
+    if (props.brokerMode === 'container') {
+      this.redisNlbSg = sg('RedisNlb', 'NLB fronting the redis container');
+    }
 
     if (props.useRdsProxy) {
       this.rdsProxySg = sg('RdsProxy', 'RDS Proxy in front of the metadata DB');
@@ -223,15 +226,33 @@ export class AirflowSecurityGroups extends Construct {
       this.opsSg,
     ];
 
-    // ---- Pass 2: wire rules ----------------------------------------------
+    // ---- Pass 2: ingress rules -------------------------------------------
+    //
+    // Ingress only. With allowAllOutbound: true, connections.allowFrom would
+    // skip the egress half anyway; addIngressRule states that outright so no
+    // reader has to know the CDK behaviour.
 
     this.wireClientAccess(clientAccess);
-    this.wireUiPath(props);
+    this.wireUiPath();
     this.wireExecutionApiPath();
-    this.wireDatabasePath(props);
+    this.wireDatabasePath();
     this.wireBrokerPath(props);
     this.wireEndpointPath();
     this.wireScrapePath(props);
+  }
+
+  /** target accepts `port` from source. */
+  private allow(
+    target: ec2.SecurityGroup,
+    source: ec2.ISecurityGroup,
+    port: ec2.Port,
+    description: string,
+  ) {
+    target.addIngressRule(
+      ec2.Peer.securityGroupId(source.securityGroupId),
+      port,
+      description,
+    );
   }
 
   // -- laptops -> public ALB ----------------------------------------------
@@ -242,7 +263,7 @@ export class AirflowSecurityGroups extends Construct {
     switch (access.kind) {
       case 'clientVpn':
       case 'privateLink':
-        this.albPublicSg.connections.allowFrom(this.clientSg!, PORT.https, desc);
+        this.allow(this.albPublicSg, this.clientSg!, PORT.https, desc);
         break;
       case 'prefixList':
         this.albPublicSg.addIngressRule(
@@ -261,69 +282,56 @@ export class AirflowSecurityGroups extends Construct {
 
   // -- public ALB -> api-server -------------------------------------------
 
-  private wireUiPath(props: AirflowSecurityGroupsProps) {
-    this.apiServerSg.connections.allowFrom(
+  private wireUiPath() {
+    // The api-server is the only thing behind the public ALB. Workers take no
+    // inbound traffic at all except the prometheus scrape.
+    this.allow(
+      this.apiServerSg,
       this.albPublicSg,
       PORT.apiServer,
       'public ALB -> api-server (UI + REST API)',
     );
-
-    if (props.enableFlower) {
-      this.workerSg.connections.allowFrom(
-        this.albPublicSg,
-        PORT.flower,
-        'public ALB -> flower',
-      );
-    }
   }
 
   // -- workers -> internal ALB -> api-server ------------------------------
 
   private wireExecutionApiPath() {
-    this.albExecSg.connections.allowFrom(
-      this.workerSg,
-      PORT.apiServer,
-      'worker -> internal ALB (Task Execution API)',
-    );
-    this.apiServerSg.connections.allowFrom(
+    // dag-processor and triggerer resolve variables/connections through the
+    // execution API as well as holding their own DB sessions.
+    for (const peer of [this.workerSg, this.dagProcessorSg, this.triggererSg]) {
+      this.allow(
+        this.albExecSg,
+        peer,
+        PORT.apiServer,
+        `${peer.node.id} -> internal ALB (Task Execution API)`,
+      );
+    }
+
+    this.allow(
+      this.apiServerSg,
       this.albExecSg,
       PORT.apiServer,
       'internal ALB -> api-server (Task Execution API)',
     );
-
-    // dag-processor and triggerer resolve variables/connections through the
-    // execution API as well as holding their own DB sessions.
-    for (const peer of [this.dagProcessorSg, this.triggererSg]) {
-      this.albExecSg.connections.allowFrom(
-        peer,
-        PORT.apiServer,
-        `${peer.node.id} -> internal ALB (execution API)`,
-      );
-    }
   }
 
   // -- control plane -> Postgres ------------------------------------------
 
-  private wireDatabasePath(props: AirflowSecurityGroupsProps) {
+  private wireDatabasePath() {
     const target = this.rdsProxySg ?? this.rdsSg;
 
     for (const client of this.dbClientSgs) {
-      target.connections.allowFrom(
-        client,
-        PORT.postgres,
-        `${client.node.id} -> metadata database`,
-      );
+      this.allow(target, client, PORT.postgres, `${client.node.id} -> metadata database`);
     }
 
     if (this.rdsProxySg) {
-      this.rdsSg.connections.allowFrom(
+      this.allow(
+        this.rdsSg,
         this.rdsProxySg,
         PORT.postgres,
         'RDS Proxy -> RDS PostgreSQL',
       );
     }
-
-    void props;
   }
 
   // -- celery broker -------------------------------------------------------
@@ -337,30 +345,28 @@ export class AirflowSecurityGroups extends Construct {
     const brokerClients = [this.schedulerSg, this.workerSg];
 
     if (this.redisNlbSg) {
-      // Two hops: task SG -> NLB SG -> broker SG.
+      // Lower envs, two hops: task SG -> NLB SG -> redis service SG.
       //
       // Security group referencing works regardless of the client IP
       // preservation setting, which matters because IP-type TCP target groups
-      // default it to off — the broker would otherwise see only the NLB's
+      // default it to off — the redis task would otherwise see only the NLB's
       // private IPs and you'd be back to allowlisting subnet CIDRs.
       for (const client of brokerClients) {
-        this.redisNlbSg.connections.allowFrom(
-          client,
-          PORT.redis,
-          `${client.node.id} -> redis NLB`,
-        );
+        this.allow(this.redisNlbSg, client, PORT.redis, `${client.node.id} -> redis NLB`);
       }
-      this.redisSg.connections.allowFrom(
+      this.allow(
+        this.redisSg,
         this.redisNlbSg,
         PORT.redis,
-        `redis NLB -> ${props.brokerMode} (includes health checks)`,
+        'redis NLB -> redis container (includes health checks)',
       );
     } else {
-      // Upper envs: tasks connect straight to the ElastiCache primary
-      // endpoint. One hop, no idle timeout to tune, and failover is handled
-      // by ElastiCache's own DNS rather than by target re-registration.
+      // Upper envs, one hop. ElastiCache's primary endpoint follows failover
+      // on its own, so there is nothing to re-register and no idle timeout to
+      // tune.
       for (const client of brokerClients) {
-        this.redisSg.connections.allowFrom(
+        this.allow(
+          this.redisSg,
           client,
           PORT.redis,
           `${client.node.id} -> ElastiCache primary endpoint`,
@@ -368,25 +374,29 @@ export class AirflowSecurityGroups extends Construct {
       }
     }
 
-    // In container mode the Redis service is itself a Fargate task and needs
-    // the endpoint path for image pulls and log shipping. ElastiCache is a
-    // managed service and needs nothing.
-    if (props.brokerMode === 'container') {
-      this.vpceSg.connections.allowFrom(
-        this.redisSg,
-        PORT.https,
-        'redis container -> interface VPC endpoints',
-      );
-    }
+    void props;
   }
 
   // -- everything -> interface endpoints -----------------------------------
 
   private wireEndpointPath() {
-    // ECR api/dkr, CloudWatch Logs, Secrets Manager, SSM, STS.
-    // S3 is a gateway endpoint and is not represented here.
-    for (const client of [...this.appSgs, this.albPublicSg, this.albExecSg]) {
-      this.vpceSg.connections.allowFrom(
+    // ECR api/dkr, CloudWatch Logs, Secrets Manager, SSM, STS, KMS.
+    // S3 is a GATEWAY endpoint: no SG, authorized by route table and endpoint
+    // policy. That policy is the real exfiltration control here — see the note
+    // at the top of this file.
+    const clients: ec2.ISecurityGroup[] = [
+      ...this.appSgs,
+      this.albPublicSg,
+      this.albExecSg,
+    ];
+
+    // In container mode the redis service is a Fargate task and needs image
+    // pulls and log shipping. ElastiCache is managed and needs nothing.
+    if (this.redisNlbSg) clients.push(this.redisSg);
+
+    for (const client of clients) {
+      this.allow(
+        this.vpceSg,
         client,
         PORT.https,
         `${client.node.id} -> interface VPC endpoints`,
@@ -411,15 +421,17 @@ export class AirflowSecurityGroups extends Construct {
   }
 
   /**
-   * Fails synth if anything has granted workers a path to Postgres. Cheap
-   * guard against a well-meaning future edit; call it from the stack.
+   * Fails synth if anything has granted workers a path to Postgres.
+   *
+   * This matters MORE now that egress is unrestricted: the worker/database
+   * boundary is carried entirely by the absence of an ingress rule, so there
+   * is no second layer to catch a mistake. Call it from the stack.
    */
   public assertWorkerDbIsolation(): void {
     const offending = this.rdsSg.node
       .findAll()
       .concat(this.rdsProxySg?.node.findAll() ?? [])
-      .filter((c) => c instanceof ec2.CfnSecurityGroupIngress)
-      .map((c) => c as ec2.CfnSecurityGroupIngress)
+      .filter((c): c is ec2.CfnSecurityGroupIngress => c instanceof ec2.CfnSecurityGroupIngress)
       .filter((r) => r.sourceSecurityGroupId === this.workerSg.securityGroupId);
 
     if (offending.length > 0) {
@@ -441,10 +453,9 @@ export interface AirflowEnvConfig {
   readonly instanceType: ec2.InstanceType;
   readonly schedulerCount: number;
   readonly apiServerCount: number;
-  readonly enableFlower: boolean;
+  readonly workerCount: number;
   readonly useRdsProxy: boolean;
   readonly brokerMode: 'elasticache' | 'container';
-  readonly brokerViaNlb: boolean;
   /** ElastiCache encryption in transit. Forces rediss:// + broker_use_ssl. */
   readonly brokerTls: boolean;
 }
@@ -456,11 +467,10 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MEDIUM),
     schedulerCount: 1,
     apiServerCount: 1,
-    enableFlower: true,
+    workerCount: 1,
     useRdsProxy: false,
     brokerMode: 'container',
-    brokerViaNlb: true,
-    brokerTls: false, // <- the divergence that will bite you; see notes
+    brokerTls: false, // no TLS, no auth token — see notes on parity
   },
   staging: {
     envName: 'staging',
@@ -469,10 +479,9 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     instanceType: ec2.InstanceType.of(ec2.InstanceClass.M6G, ec2.InstanceSize.LARGE),
     schedulerCount: 2,
     apiServerCount: 2,
-    enableFlower: false,
+    workerCount: 2,
     useRdsProxy: true,
     brokerMode: 'elasticache',
-    brokerViaNlb: false, // ElastiCache primary endpoint, no NLB
     brokerTls: true,
   },
   prod: {
@@ -481,10 +490,9 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
     instanceType: ec2.InstanceType.of(ec2.InstanceClass.M6G, ec2.InstanceSize.XLARGE),
     schedulerCount: 2,
     apiServerCount: 2,
-    enableFlower: false,
+    workerCount: 4,
     useRdsProxy: true,
     brokerMode: 'elasticache',
-    brokerViaNlb: false, // ElastiCache primary endpoint, no NLB
     brokerTls: true,
   },
 };
@@ -498,12 +506,14 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 // const sgs = new AirflowSecurityGroups(this, 'AirflowSgs', {
 //   vpc,
 //   envName: cfg.envName,
+//   brokerMode: cfg.brokerMode,
 //   useRdsProxy: cfg.useRdsProxy,
-//   enableFlower: cfg.enableFlower,
 //   clientAccess: { kind: 'prefixList', prefixListId: corpLaptopPrefixList.ref },
 //   prometheusPeer: ec2.Peer.securityGroupId(prometheusSg.securityGroupId),
 // });
 // sgs.assertWorkerDbIsolation();
+//
+// --- RDS ------------------------------------------------------------------
 //
 // Build the DB subnet group across >= 2 AZs in EVERY env, including dev where
 // multiAz is false. A single-AZ subnet group cannot be flipped to Multi-AZ
@@ -520,6 +530,45 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 //   }),
 // });
 //
+// --- Fargate services ------------------------------------------------------
+//
+// securityGroups is set at service creation. Omit it and CDK silently creates
+// its own SG, which defeats the mesh above — always pass it explicitly.
+//
+// const service = (id: string, taskDef: ecs.FargateTaskDefinition,
+//                  securityGroup: ec2.ISecurityGroup, desiredCount: number) =>
+//   new ecs.FargateService(this, id, {
+//     cluster,
+//     taskDefinition: taskDef,
+//     desiredCount,
+//     securityGroups: [securityGroup],
+//     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+//     assignPublicIp: false,
+//     circuitBreaker: { rollback: true },
+//     minHealthyPercent: 100,
+//     maxHealthyPercent: 200, // note: doubles DB connections mid-deploy
+//   });
+//
+// const apiServer    = service('ApiServer',    apiServerTask,    sgs.apiServerSg,    cfg.apiServerCount);
+// const scheduler    = service('Scheduler',    schedulerTask,    sgs.schedulerSg,    cfg.schedulerCount);
+// const dagProcessor = service('DagProcessor', dagProcessorTask, sgs.dagProcessorSg, 1);
+// const triggerer    = service('Triggerer',    triggererTask,    sgs.triggererSg,    2);
+// const worker       = service('Worker',       workerTask,       sgs.workerSg,       cfg.workerCount);
+//
+// Register the api-server with both listeners; the SG rules already exist.
+//   publicListener.addTargets('ApiServerUi', { port: 8080, targets: [apiServer] });
+//   execListener.addTargets('ApiServerExec', { port: 8080, targets: [apiServer] });
+//
+// One-shot ops tasks have no service; the SG is passed at run time:
+//   new tasks.EcsRunTask(this, 'DbMigrate', {
+//     securityGroups: [sgs.opsSg],
+//     launchTarget: new tasks.EcsFargateLaunchTarget(),
+//     // ...
+//   });
+//
+// Do NOT use ApplicationLoadBalancedFargateService — it manages its own SG and
+// you lose the ability to pin the api-server to apiServerSg.
+//
 // --- Redis NLB (LOWER ENVS ONLY) -------------------------------------------
 //
 // Upper envs skip all of this and point the broker URL at the ElastiCache
@@ -534,10 +583,10 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 //   });
 //   const listener = redisNlb.addListener('RedisListener', { port: 6379 });
 //
-//   // The generic service() helper above uses 100/200 for rolling deploys.
-//   // Do NOT do that here. Two redis containers behind one target group means
-//   // two independent brokers, and queued messages on the departing one go
-//   // invisible — tasks appear to vanish. Force one-at-a-time instead:
+//   // The generic service() helper uses 100/200 for rolling deploys. Do NOT
+//   // do that here: two redis containers behind one target group means two
+//   // independent brokers, and messages queued on the departing one go
+//   // invisible — tasks appear to vanish mid-deploy.
 //   const redisService = new ecs.FargateService(this, 'Redis', {
 //     cluster,
 //     taskDefinition: redisTask,
@@ -548,8 +597,7 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 //     maxHealthyPercent: 100, // never two brokers at once
 //   });
 //
-//   // ECS registers and deregisters task IPs itself, so targets stay current
-//   // across redeploys with no extra machinery.
+//   // ECS keeps target registration current across deploys by itself.
 //   redisService.registerLoadBalancerTargets({
 //     containerName: 'redis',
 //     containerPort: 6379,
@@ -558,49 +606,7 @@ export const AIRFLOW_ENVS: Record<string, AirflowEnvConfig> = {
 //   });
 // }
 //
-// The NLB's 350s TCP idle timeout applies only in these lower envs. Celery
-// workers hold idle broker connections while polling, so set socket_keepalive
-// below that threshold — otherwise dev shows worker hangs that upper envs
-// never reproduce, which is a confusing way to spend an afternoon.
-//
-// --- Attaching SGs to Fargate services -------------------------------------
-//
-// securityGroups is an array and is set at service creation. Omit it and CDK
-// silently creates its own SG with allowAllOutbound: true, which defeats the
-// entire mesh above — always pass it explicitly.
-//
-// const service = (id: string, taskDef: ecs.FargateTaskDefinition,
-//                  securityGroup: ec2.ISecurityGroup, desiredCount: number) =>
-//   new ecs.FargateService(this, id, {
-//     cluster,
-//     taskDefinition: taskDef,
-//     desiredCount,
-//     securityGroups: [securityGroup],
-//     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-//     assignPublicIp: false,
-//     circuitBreaker: { rollback: true },
-//     minHealthyPercent: 100,
-//     maxHealthyPercent: 200, // note: doubles DB connections mid-deploy
-//   });
-//
-// const apiServer    = service('ApiServer',    apiServerTask,    sgs.apiServerSg,    cfg.apiServerCount);
-// const scheduler    = service('Scheduler',    schedulerTask,    sgs.schedulerSg,    cfg.schedulerCount);
-// const dagProcessor = service('DagProcessor', dagProcessorTask, sgs.dagProcessorSg, 1);
-// const triggerer    = service('Triggerer',    triggererTask,    sgs.triggererSg,    2);
-// const worker       = service('Worker',       workerTask,       sgs.workerSg,       cfg.workerCount);
-//
-// Register the api-server with both listeners; the SG rules already exist.
-//   publicListener.addTargets('ApiServerUi',   { port: 8080, targets: [apiServer] });
-//   execListener.addTargets('ApiServerExec',   { port: 8080, targets: [apiServer] });
-//
-// For one-shot ops tasks (db migrate, backfill) there is no service — the SG
-// is passed at run time instead:
-//   new tasks.EcsRunTask(this, 'DbMigrate', {
-//     ...
-//     securityGroups: [sgs.opsSg],
-//     launchTarget: new tasks.EcsFargateLaunchTarget(),
-//   });
-//
-// Do NOT use ApplicationLoadBalancedFargateService here — it creates and
-// manages its own SG, and you lose the ability to pin the api-server to
-// apiServerSg. Compose the pieces manually.
+// The NLB's 350s TCP idle timeout applies only in lower envs. Celery workers
+// hold idle broker connections while polling, so set socket_keepalive below
+// that threshold — otherwise dev shows worker hangs that upper envs never
+// reproduce.
