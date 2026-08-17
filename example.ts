@@ -94,7 +94,7 @@ export class AirflowRuntimeStack extends Stack {
   constructor(
     scope: App,
     id: string,
-    props: EnvProps & { schedulerCount: number; uiClientCidrs: string[] },
+    props: EnvProps & { schedulerCount: number },
   ) {
     super(scope, id, props);
     const { envName } = props;
@@ -117,8 +117,14 @@ export class AirflowRuntimeStack extends Stack {
     const sgs = new AirflowSecurityGroups(this, 'Sgs', {
       vpc,
       envName,
-      // One place per env. Tightening this later is a one-line change.
-      uiClientCidrs: props.uiClientCidrs,
+      // Owned elsewhere; imported mutable: false since nothing here adds
+      // rules to it. It gets ATTACHED to the ALB, never referenced as a peer.
+      uiClients: ec2.SecurityGroup.fromSecurityGroupId(
+        this,
+        'UiClientsSg',
+        ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/ui-clients')),
+        { mutable: false },
+      ),
       // Prometheus discovers tasks via Cloud Map and connects to task IPs, so
       // the peer is the Prometheus host's SG, not a load balancer.
       prometheus: ec2.Peer.securityGroupId(
@@ -191,9 +197,6 @@ const platform = new AirflowPlatformStack(app, `${envName}-airflow-platform`, {
 const runtime = new AirflowRuntimeStack(app, `${envName}-airflow-runtime`, {
   envName,
   schedulerCount: isUpper ? 2 : 1,
-  // Broad for now, matching what the shared group already permitted. Narrow
-  // once a customer-managed prefix list for the operator ranges exists.
-  uiClientCidrs: ['10.0.0.0/8'],
 });
 
 // SSM parameters create no CloudFormation dependency, so ordering is declared
