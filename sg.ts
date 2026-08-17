@@ -25,21 +25,26 @@ export interface AirflowSecurityGroupsProps {
   readonly envName: string;
 
   /**
-   * The group holding the client ranges that may reach the UI on 443.
+   * The public ALB's security group, created in the platform stack.
    *
-   * ATTACH it to the ALB — do not let anything reference it as a source peer.
-   * That distinction decides whether this works: a group holding a list of
-   * CIDRs grants nothing when referenced by another group, because SG rules
-   * are not transitive. Referencing group A means "traffic from ENIs carrying
-   * A", not "traffic matching A's own rules". The failure is silent — clean
-   * synth, successful deploy, unreachable UI.
-   *
-   *   securityGroups: sgs.albSecurityGroups
-   *
-   * Nothing in this construct adds rules to it, so pass it imported with
-   * mutable: false if it is owned by another stack.
+   * Import it MUTABLE — this construct adds the client ingress rules to it,
+   * so they synthesize in the runtime stack and the dependency runs
+   * runtime -> platform.
    */
-  readonly uiClients: ec2.ISecurityGroup;
+  readonly alb: ec2.ISecurityGroup;
+
+  /**
+   * Who may reach the UI. Pass ec2.Peer.ipv4('10.0.0.0/8'), a prefix list, or
+   * ec2.Peer.securityGroupId(...).
+   *
+   * If it is a security group, it only works when that group is ATTACHED to
+   * something in the request path. Referencing group A as a source means
+   * "traffic from ENIs carrying A", not "traffic matching A's own rules" — SG
+   * rules are not transitive. A group that merely lists laptop CIDRs grants
+   * nothing here, and the failure is silent: clean synth, clean deploy,
+   * unreachable UI.
+   */
+  readonly uiClients: ec2.IPeer;
 
   /** Where Prometheus scrapes from. Omit if you don't scrape. */
   readonly prometheus?: ec2.IPeer;
@@ -76,6 +81,8 @@ export interface AirflowSecurityGroupsProps {
 }
 
 const PORT = {
+  http: ec2.Port.tcp(80),
+  https: ec2.Port.tcp(443),
   api: ec2.Port.tcp(8080),
   postgres: ec2.Port.tcp(5432),
   redis: ec2.Port.tcp(6379),
@@ -83,16 +90,6 @@ const PORT = {
 };
 
 export class AirflowSecurityGroups extends Construct {
-  /** The ALB's own group. Holds no client ranges; those live on `uiClients`. */
-  readonly alb: ec2.SecurityGroup;
-
-  /**
-   * Exactly what the ALB should be given: its own group plus the client
-   * group. Spread this rather than passing `alb` alone — forgetting the
-   * client group is the one mistake here that deploys cleanly and leaves the
-   * UI unreachable.
-   */
-  readonly albSecurityGroups: ec2.ISecurityGroup[];
   /** api-server: serves the UI and the Task Execution API. */
   readonly api: ec2.SecurityGroup;
   readonly scheduler: ec2.SecurityGroup;
@@ -120,8 +117,6 @@ export class AirflowSecurityGroups extends Construct {
         allowAllOutbound: true, // see header
       });
 
-    this.alb = sg('Alb', 'ALB fronting the Airflow UI');
-    this.albSecurityGroups = [this.alb, props.uiClients];
     this.api = sg('Api', 'api-server');
     this.scheduler = sg('Scheduler', 'scheduler');
     this.dagProcessor = sg('DagProcessor', 'dag-processor');
@@ -166,12 +161,19 @@ export class AirflowSecurityGroups extends Construct {
       why: string,
     ) => target.addIngressRule(source, port, why);
 
-    // UI. The client ranges live on props.uiClients, attached to the ALB, so
-    // nothing here references them. If those ranges are broad (10/8), every
-    // workload in the VPC can reach the UI — a known gap, but confined to
-    // port 443 on one load balancer. Nothing else in this mesh accepts a
-    // CIDR: the database and broker take only named service groups.
-    allow(this.api, this.alb, PORT.api, 'ALB -> api-server');
+    // UI. Both ports: the HTTP->HTTPS redirect is a listener action, so the
+    // request must reach the ALB on 80 before it can be redirected. Allow 443
+    // only and anyone typing http:// gets a connection timeout that looks like
+    // an outage rather than a misconfiguration.
+    //
+    // This is the one place in the mesh that accepts a client range. If that
+    // range is broad (10/8), every workload in the VPC can reach the UI —
+    // known, and confined to these two ports on one load balancer. The
+    // database and broker accept only named service groups.
+    allow(props.alb, props.uiClients, PORT.https, 'UI clients -> ALB');
+    allow(props.alb, props.uiClients, PORT.http, 'UI clients -> ALB (redirect to HTTPS)');
+
+    allow(this.api, props.alb, PORT.api, 'public ALB -> api-server');
 
     // Task Execution API: client -> internal ALB -> api-server.
     for (const c of EXEC_API_CLIENTS) {
@@ -230,13 +232,6 @@ open egress, which defeats the mesh:
     cluster, taskDefinition,
     securityGroups: [sgs.scheduler],
     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
-  });
-
-The ALB carries TWO groups — its own, plus the one holding the client ranges:
-
-  new elbv2.ApplicationLoadBalancer(this, 'Alb', {
-    vpc, internetFacing: false,
-    securityGroups: sgs.albSecurityGroups,
   });
 
   api-server    -> sgs.api           dag-processor -> sgs.dagProcessor
