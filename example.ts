@@ -178,14 +178,6 @@ export class AirflowRuntimeStack extends Stack {
         ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/prometheus')),
       ),
       rds: rdsSg,
-      // The internal ALB workers already use. Import mutable — the construct
-      // writes the 8080 rules onto it.
-      execAlb: ec2.SecurityGroup.fromSecurityGroupId(
-        this,
-        'ExecAlbSg',
-        ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/exec-alb')),
-        { mutable: true },
-      ),
       // Lower envs front the redis container with an NLB; upper envs talk to
       // ElastiCache directly. The construct creates the NLB's group, which is
       // handed to the NLB at creation below.
