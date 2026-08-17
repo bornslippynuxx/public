@@ -101,6 +101,7 @@ export class AirflowRuntimeStack extends Stack {
 
     const vpc = ec2.Vpc.fromLookup(this, 'Vpc', { vpcName: `${envName}-airflow` });
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
+    const isLowerEnv = envName === 'dev';
 
     // mutable: true is required and deliberate. The construct adds the 5432
     // ingress rule to this group, and because the import is scoped to THIS
@@ -125,13 +126,35 @@ export class AirflowRuntimeStack extends Stack {
         ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/ui-clients')),
         { mutable: false },
       ),
-      // Prometheus discovers tasks via Cloud Map and connects to task IPs, so
-      // the peer is the Prometheus host's SG, not a load balancer.
+      // Prometheus connects to task IPs directly, so the peer is the
+      // Prometheus host's SG, not a load balancer.
       prometheus: ec2.Peer.securityGroupId(
         ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/prometheus')),
       ),
       rds: rdsSg,
+      // The internal ALB workers already use. Import mutable — the construct
+      // writes the 8080 rules onto it.
+      execAlb: ec2.SecurityGroup.fromSecurityGroupId(
+        this,
+        'ExecAlbSg',
+        ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/exec-alb')),
+        { mutable: true },
+      ),
+      // Lower envs front the redis container with an NLB; upper envs talk to
+      // ElastiCache directly. The construct creates the NLB's group, which is
+      // handed to the NLB at creation below.
+      redisViaNlb: isLowerEnv,
     });
+
+    // if (isLowerEnv) {
+    //   const redisNlb = new elbv2.NetworkLoadBalancer(this, 'RedisNlb', {
+    //     vpc,
+    //     internetFacing: false,
+    //     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+    //     securityGroups: [sgs.redisNlb!], // creation-time only
+    //   });
+    //   ...listener + redisService.registerLoadBalancerTargets(...)
+    // }
 
     const logGroup = logs.LogGroup.fromLogGroupArn(
       this,
@@ -165,6 +188,8 @@ export class AirflowRuntimeStack extends Stack {
     declare const triggererTask: ecs.FargateTaskDefinition;
     declare const workerTask: ecs.FargateTaskDefinition;
 
+    // Keep whatever service discovery / load balancer wiring you already
+    // have. Only the securityGroups argument changes in this refactor.
     service('ApiServer', apiServerTask, sgs.api, 2);
     service('Scheduler', schedulerTask, sgs.scheduler, props.schedulerCount);
     service('DagProcessor', dagProcessorTask, sgs.dagProcessor, 1);
