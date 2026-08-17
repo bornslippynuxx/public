@@ -25,19 +25,21 @@ export interface AirflowSecurityGroupsProps {
   readonly envName: string;
 
   /**
-   * Ranges allowed to reach the UI on 443, e.g. ['10.0.0.0/8'].
+   * The group holding the client ranges that may reach the UI on 443.
    *
-   * These become ingress rules on `uiClients`, which is ATTACHED to the ALB.
-   * That distinction is the whole point: a security group holding a list of
-   * CIDRs does nothing when REFERENCED as a source by another group. SG rules
-   * are not transitive — referencing group A means "traffic from ENIs
-   * carrying A", not "traffic matching A's own rules". The failure is silent:
-   * the rule synthesizes, the deploy succeeds, the UI is unreachable.
+   * ATTACH it to the ALB — do not let anything reference it as a source peer.
+   * That distinction decides whether this works: a group holding a list of
+   * CIDRs grants nothing when referenced by another group, because SG rules
+   * are not transitive. Referencing group A means "traffic from ENIs carrying
+   * A", not "traffic matching A's own rules". The failure is silent — clean
+   * synth, successful deploy, unreachable UI.
    *
-   * So: attach `uiClients` to every load balancer that should accept these
-   * ranges. Never pass it as a source peer.
+   *   securityGroups: [sgs.alb, uiClients]
+   *
+   * Nothing in this construct adds rules to it, so pass it imported with
+   * mutable: false if it is owned by another stack.
    */
-  readonly uiClientCidrs: string[];
+  readonly uiClients: ec2.ISecurityGroup;
 
   /** Where Prometheus scrapes from. Omit if you don't scrape. */
   readonly prometheus?: ec2.IPeer;
@@ -62,15 +64,6 @@ const PORT = {
 };
 
 export class AirflowSecurityGroups extends Construct {
-  /**
-   * Carries the client ranges. ATTACH this to the ALB alongside `alb`, and to
-   * any other load balancer in this stack serving a UI to the same audience.
-   * Keeping the ranges in one named group means tightening them later — when
-   * a customer-managed prefix list exists — is a one-line change here rather
-   * than an audit of every rule.
-   */
-  readonly uiClients: ec2.SecurityGroup;
-
   /** The ALB's own group. Holds no client ranges; those live on `uiClients`. */
   readonly alb: ec2.SecurityGroup;
   /** api-server: serves the UI and the Task Execution API. */
@@ -97,7 +90,6 @@ export class AirflowSecurityGroups extends Construct {
         allowAllOutbound: true, // see header
       });
 
-    this.uiClients = sg('UiClients', 'ranges allowed to reach Airflow UIs');
     this.alb = sg('Alb', 'ALB fronting the Airflow UI');
     this.api = sg('Api', 'api-server');
     this.scheduler = sg('Scheduler', 'scheduler');
@@ -140,16 +132,11 @@ export class AirflowSecurityGroups extends Construct {
       why: string,
     ) => target.addIngressRule(source, port, why);
 
-    // UI. The ranges land on uiClients, which is attached to the ALB — see
-    // the note on uiClientCidrs. A broad range here (10/8) means every
-    // workload in the VPC can reach the UI, not just laptops. That is a known
-    // gap pending a prefix list; it is deliberately confined to this one
-    // group and to port 443 on the ALB. Nothing else in this mesh accepts a
+    // UI. The client ranges live on props.uiClients, attached to the ALB, so
+    // nothing here references them. If those ranges are broad (10/8), every
+    // workload in the VPC can reach the UI — a known gap, but confined to
+    // port 443 on one load balancer. Nothing else in this mesh accepts a
     // CIDR: the database and broker take only named service groups.
-    for (const cidr of props.uiClientCidrs) {
-      allow(this.uiClients, ec2.Peer.ipv4(cidr), PORT.https, `${cidr} -> Airflow UI`);
-    }
-
     allow(this.api, this.alb, PORT.api, 'ALB -> api-server');
 
     // Task Execution API (clients reach the api-server via Cloud Map)
@@ -196,7 +183,7 @@ The ALB carries TWO groups — its own, plus the one holding the client ranges:
 
   new elbv2.ApplicationLoadBalancer(this, 'Alb', {
     vpc, internetFacing: false,
-    securityGroups: [sgs.alb, sgs.uiClients],
+    securityGroups: [sgs.alb, uiClients],
   });
 
   api-server    -> sgs.api           dag-processor -> sgs.dagProcessor
