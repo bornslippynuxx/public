@@ -26,6 +26,8 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import { AirflowSecurityGroups } from './airflow-security-groups';
 
 interface EnvProps extends StackProps {
@@ -39,7 +41,11 @@ const paramPath = (env: string, leaf: string) => `/airflow/${env}/${leaf}`;
 // ---------------------------------------------------------------------------
 
 export class AirflowPlatformStack extends Stack {
-  constructor(scope: App, id: string, props: EnvProps & { multiAz: boolean }) {
+  constructor(
+    scope: App,
+    id: string,
+    props: EnvProps & { multiAz: boolean; certificateArn: string },
+  ) {
     super(scope, id, props);
     const { envName } = props;
 
@@ -60,6 +66,40 @@ export class AirflowPlatformStack extends Stack {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.M6G, ec2.InstanceSize.LARGE),
       deletionProtection: envName === 'prod',
       removalPolicy: envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+    });
+
+    // Public ALB. No securityGroups prop — it creates its own, and the runtime
+    // stack adds the client ingress rules to it.
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
+      vpc,
+      internetFacing: false,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+    });
+
+    // The redirect is a listener action, so port 80 has to be reachable for it
+    // to fire. The matching SG rule is added in the runtime stack alongside
+    // the 443 rule.
+    alb.addListener('Http', {
+      port: 80,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      defaultAction: elbv2.ListenerAction.redirect({
+        protocol: 'HTTPS',
+        port: '443',
+        permanent: true,
+      }),
+    });
+
+    // Default action is a placeholder: the api-server target group lives in
+    // the runtime stack, which imports this listener and adds the rule that
+    // routes to it.
+    const httpsListener = alb.addListener('Https', {
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [acm.Certificate.fromCertificateArn(this, 'Cert', props.certificateArn)],
+      defaultAction: elbv2.ListenerAction.fixedResponse(503, {
+        contentType: 'text/plain',
+        messageBody: 'airflow api-server not registered',
+      }),
     });
 
     const logGroup = new logs.LogGroup(this, 'AirflowLogs', {
@@ -83,6 +123,11 @@ export class AirflowPlatformStack extends Stack {
     // group that no longer exists.
     publish('logs/arn', logGroup.logGroupArn);
     publish('db/endpoint', db.dbInstanceEndpointAddress);
+
+    // The group the ALB made for itself. Runtime imports this mutable and
+    // writes the client rules onto it.
+    publish('sg/alb', alb.connections.securityGroups[0].securityGroupId);
+    publish('alb/https-listener-arn', httpsListener.listenerArn);
   }
 }
 
@@ -118,14 +163,15 @@ export class AirflowRuntimeStack extends Stack {
     const sgs = new AirflowSecurityGroups(this, 'Sgs', {
       vpc,
       envName,
-      // Owned elsewhere; imported mutable: false since nothing here adds
-      // rules to it. It gets ATTACHED to the ALB, never referenced as a peer.
-      uiClients: ec2.SecurityGroup.fromSecurityGroupId(
+      // The platform ALB's group. mutable: true — the construct writes the
+      // client ingress rules onto it from here.
+      alb: ec2.SecurityGroup.fromSecurityGroupId(
         this,
-        'UiClientsSg',
-        ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/ui-clients')),
-        { mutable: false },
+        'AlbSg',
+        ssm.StringParameter.valueForStringParameter(this, paramPath(envName, 'sg/alb')),
+        { mutable: true },
       ),
+      uiClients: ec2.Peer.ipv4('10.0.0.0/8'),
       // Prometheus connects to task IPs directly, so the peer is the
       // Prometheus host's SG, not a load balancer.
       prometheus: ec2.Peer.securityGroupId(
@@ -217,6 +263,7 @@ const isUpper = envName !== 'dev';
 const platform = new AirflowPlatformStack(app, `${envName}-airflow-platform`, {
   envName,
   multiAz: isUpper,
+  certificateArn: app.node.tryGetContext('certificateArn'),
 });
 
 const runtime = new AirflowRuntimeStack(app, `${envName}-airflow-runtime`, {
