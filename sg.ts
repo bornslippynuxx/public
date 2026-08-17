@@ -25,7 +25,8 @@ export interface AirflowSecurityGroupsProps {
   readonly envName: string;
 
   /**
-   * The public ALB's security group, created in the platform stack.
+   * The ALB's security group, created in the platform stack. One ALB serves
+   * both the UI and the Task Execution API.
    *
    * Import it MUTABLE — this construct adds the client ingress rules to it,
    * so they synthesize in the runtime stack and the dependency runs
@@ -62,12 +63,6 @@ export interface AirflowSecurityGroupsProps {
    * outage. Fine in a lower env, but expect the replacement in the diff.
    */
   readonly redisViaNlb?: boolean;
-
-  /**
-   * The internal ALB workers reach the api-server through. Import it MUTABLE —
-   * this construct adds the 8080 ingress rules to it.
-   */
-  readonly execAlb: ec2.ISecurityGroup;
 
   /**
    * The RDS instance's own security group, created by the data stack.
@@ -173,13 +168,19 @@ export class AirflowSecurityGroups extends Construct {
     allow(props.alb, props.uiClients, PORT.https, 'UI clients -> ALB');
     allow(props.alb, props.uiClients, PORT.http, 'UI clients -> ALB (redirect to HTTPS)');
 
-    allow(this.api, props.alb, PORT.api, 'public ALB -> api-server');
+    allow(this.api, props.alb, PORT.api, 'ALB -> api-server');
 
-    // Task Execution API: client -> internal ALB -> api-server.
+    // Task Execution API. There is one ALB, so this rides the same 443
+    // listener the UI uses; the api-server rule above already covers the
+    // ALB -> api-server hop on 8080.
+    //
+    // Worth knowing: anything that can reach this ALB on 443 can reach the
+    // /execution endpoints too. Airflow 3 authenticates them with per-task JWT
+    // tokens, so it is not open, but the exposure is wider than a separate
+    // internal listener would give.
     for (const c of EXEC_API_CLIENTS) {
-      allow(props.execAlb, c, PORT.api, `${c.node.id} -> internal ALB`);
+      allow(props.alb, c, PORT.https, `${c.node.id} -> ALB (execution API)`);
     }
-    allow(this.api, props.execAlb, PORT.api, 'internal ALB -> api-server');
 
     // Metadata database
     for (const c of DB_CLIENTS) {
